@@ -7,11 +7,10 @@ import random
 import asyncio
 from collections import deque
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from io import BytesIO
-import requests
+from yt_dlp import YoutubeDL
+from typing import Optional
 import youtube_dl
-import math
 
 # ================== CONFIGURAÇÕES BÁSICAS ==================
 RAID_LIMITE = 5
@@ -19,25 +18,70 @@ RAID_INTERVALO = 10
 entradas_recent = deque()
 ID_DO_CANAL_DE_ALERTA = 1396668435794104481
 
+# Configurações do YTDL e FFmpeg
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'quiet': True,
+    'extract_flat': False
+}
+
+ffmpeg_options = {
+    'options': '-vn'
+}
+
+ytdl = YoutubeDL(ytdl_format_options)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get("title")
+        self.url = data.get("url")
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(
+            None, lambda: ytdl.extract_info(url, download=not stream)
+        )
+
+        if not data:
+            raise Exception("❌ Não foi possível obter informações do vídeo.")
+
+        if isinstance(data, dict) and "entries" in data:
+            if data["entries"]:
+                data = data["entries"][0]
+            else:
+                raise Exception("❌ Nenhum vídeo encontrado.")
+
+        filename = data["url"] if stream else ytdl.prepare_filename(data)
+
+        # CORRETO: não usar stderr="string" nem pipe="string"
+        source = discord.FFmpegPCMAudio(filename, options=ffmpeg_options['options'])
+        return cls(source, data=data)
+
 class MeuBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.members = True
-        intents.voice_states = True
-        super().__init__(command_prefix="&", intents=intents)
+            def __init__(self):
+                intents = discord.Intents.default()
+                intents.message_content = True
+                intents.members = True
+                intents.voice_states = True
+                super().__init__(command_prefix="&", intents=intents)
 
-        # Inicialização de variáveis do bot
-        self.playlist = []
-        self.current_song = None
-        self.voice_client = None
-        self.radio_playing = False
+                # Inicialização de variáveis do bot
+                self.playlist = []
+                self.current_song: Optional['YTDLSource'] = None
+                self.voice_client = None
+                self.radio_playing = False
+                self.radio_task = None
 
-    async def setup_hook(self):
-        self.loop.create_task(trocar_loja_periodicamente())
-        self.loop.create_task(evento_sazonal_check())
-        self.loop.create_task(radio_24_7())
-        atualizar_atividade.start()
+            async def setup_hook(self):
+                self.loop.create_task(trocar_loja_periodicamente())
+                self.loop.create_task(evento_sazonal_check())
+                self.radio_task = self.loop.create_task(radio_24_7())
+                if not atualizar_atividade.is_running():
+                    atualizar_atividade.start()
 
 bot = MeuBot()
 bot.remove_command("help")
@@ -221,49 +265,65 @@ async def evento_sazonal_check():
     evento = evento_ativo()
     if evento:
         canal = bot.get_channel(ID_DO_CANAL_DE_ALERTA)
-        if canal:
+        if canal and isinstance(canal, discord.TextChannel):
             await canal.send(evento["mensagem"])
 
-# ================== SISTEMA DE MÚSICA ==================
-ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0'
-}
+        # ================== SISTEMA DE MÚSICA ==================
+        ytdl_format_options = {
+            'format': 'bestaudio/best',
+            'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+            'restrictfilenames': True,
+            'noplaylist': True,
+            'nocheckcertificate': True,
+            'ignoreerrors': False,
+            'logtostderr': False,
+            'quiet': True,
+            'no_warnings': True,
+            'default_search': 'auto',
+            'source_address': '0.0.0.0'
+        }
 
-ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
-}
+        ffmpeg_options = {
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            'options': '-vn'
+        }
 
-ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+        ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
-class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.5):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get('title')
-        self.url = data.get('url')
+        class YTDLSource(discord.PCMVolumeTransformer):
+            def __init__(self, source, *, data, volume=0.5):
+                super().__init__(source, volume)
+                self.data = data
+                self.title = data.get('title')
+                self.url = data.get('url')
 
-    @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
-        loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+            @classmethod
+            async def from_url(cls, url, *, loop=None, stream=False):
+                loop = loop or asyncio.get_event_loop()
+                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
 
-        if 'entries' in data:
-            data = data['entries'][0]
+                if not data:
+                    raise Exception("Não foi possível obter dados do vídeo")
 
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+                if 'entries' in data and data['entries']:
+                    if data['entries']:
+                        data = data['entries'][0]
+                    else:
+                        raise Exception("Nenhum vídeo encontrado")
 
+                if stream:
+                    filename = data['url']
+                else:
+                    filename = ytdl.prepare_filename(data)
+
+                # Criar o processo FFmpeg corretamente
+                ffmpeg_process = discord.FFmpegPCMAudio(
+                    source=filename,
+                    before_options=ffmpeg_options['before_options'],
+                    options=ffmpeg_options['options']
+                )
+
+                return cls(ffmpeg_process, data=data)
 # ================== SISTEMA DE RPG ==================
 classes_rpg = {
     "guerreiro": {"vida": 120, "ataque": 25, "defesa": 20, "agilidade": 10},
@@ -417,7 +477,7 @@ async def on_member_join(member):
 
     if len(entradas_recent) > RAID_LIMITE:
         canal_alerta = bot.get_channel(ID_DO_CANAL_DE_ALERTA)
-        if canal_alerta:
+        if canal_alerta and isinstance(canal_alerta, discord.TextChannel):
             await canal_alerta.send(f"🚨 **POSSÍVEL RAID DETECTADO!** Mais de {RAID_LIMITE} membros entraram em {RAID_INTERVALO} segundos.")
 
         try:
@@ -471,12 +531,14 @@ async def skip(ctx):
 async def stop(ctx):
     """Para a música e desconecta"""
     if bot.voice_client:
-        bot.radio_playing = False
-        await bot.voice_client.disconnect()
+        bot.radio_playing = False  # só atribuição, não precisa de await
+        bot.voice_client.stop()    # stop é sincrono
+        bot.voice_client.disconnect()  # disconnect é asyncc
         bot.voice_client = None
         await ctx.send("⏹️ Música parada e desconectado!")
     else:
         await ctx.send("❌ Não estou conectado a nenhum canal.")
+
 
 @bot.command()
 @apenas_no_canal(CANAL_MUSICA)
@@ -519,7 +581,7 @@ async def criar_char(ctx, classe: str, *, nome: str):
 
 @bot.command()
 @apenas_no_canal(CANAL_JOGOS)
-async def status_rpg(ctx, member: discord.Member = None):
+async def status_rpg(ctx, member: Optional[discord.Member] = None):
     """Mostra status do personagem RPG"""
     target = member or ctx.author
     player = get_rpg_player(target.id)
@@ -690,12 +752,12 @@ async def hit(ctx):
 @bot.command()
 @apenas_no_canal(CANAL_JOGOS)
 async def stand(ctx):
-    """Para de pedir cartas e finaliza o jogo"""
+    """Para de pedir cartas и finaliza o jogo"""
     if ctx.author.id not in jogos_blackjack:
         return await ctx.send("❌ Você não tem um jogo ativo! Use `&blackjack <aposta>` para começar.")
 
     jogo = jogos_blackjack[ctx.author.id]
-    
+
     # Dealer joga
     while valor_mao(jogo["dealer"]) < 17:
         jogo["dealer"].append(jogo["baralho"].pop())
@@ -880,7 +942,8 @@ async def rank_xp(ctx):
                 value=f"Nível {data['nivel']} - {data['xp']:,} XP",
                 inline=False
             )
-        except:
+        except Exception as e:
+            print(f"Erro ao processar usuário {user_id}: {e}")
             continue
 
     await ctx.send(embed=embed)
@@ -946,8 +1009,7 @@ async def trabalhar(ctx):
 @bot.check
 async def checar_canal(ctx):
     if ctx.channel.id not in CANAL_AUTORIZADO:
-        canais_mention = ", ".join(f"<#{id}>" for id in CANAL_AUTORIZADO[:5])
-        await ctx.send(f"❌ Comandos só podem ser usados nos canais autorizados.")
+        await ctx.send("❌ Comandos só podem ser usados nos canais autorizados.")
         return False
     return True
 
@@ -995,7 +1057,7 @@ async def trocar_loja_periodicamente():
 
         for canal_id in ID_DO_CANAL_DE_ANUNCIOS:
             canal = bot.get_channel(canal_id)
-            if canal:
+            if canal and isinstance(canal, discord.TextChannel):
                 await canal.send(f"🛍️ A loja mudou para **{lojas[loja_atual_index]['nome']}**! Cryptos atualizadas!")
 
         await asyncio.sleep(tempo_troca)
@@ -1045,7 +1107,7 @@ async def ping(ctx):
 @bot.command()
 async def abraco(ctx, m: discord.Member):
     gifs = [
-        "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExYmV5cGdsYjJrbjI3ZWp4MjF2c2VvcGZidnI2bzBuYW83ajQ2MWF0dCZlcD12MV9naWZzX3NlYXJjaCZjdD1n/svXXBgduBsJ1u/giphy.gif",
+        "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExYmV5cGdsYjJrbjI3ZWp4MjF2c2VvcGZidnI2bzBuYW83ajQ2MWF0dCZlcD12MV9naWZzX3NlYXJjaCZjdT1n/svXXBgduBsJ1u/giphy.gif",
     ]
     gif_url = random.choice(gifs)
     embed = discord.Embed(description=f"{ctx.author.mention} abraçou {m.mention} 🤗", color=discord.Color.purple())
@@ -1087,22 +1149,22 @@ async def transferir(ctx, membro: discord.Member, valor: int):
     """Transfere moedas para outro usuário"""
     if valor <= 0:
         return await ctx.send("❌ Valor deve ser positivo!")
-    
+
     saldo_atual = get_saldo(ctx.author.id)
     if saldo_atual < valor:
         return await ctx.send(f"❌ Saldo insuficiente! Você tem {saldo_atual:,} moedas.")
-    
+
     if membro.bot:
         return await ctx.send("❌ Não é possível transferir para bots!")
-    
+
     set_saldo(ctx.author.id, saldo_atual - valor)
     set_saldo(membro.id, get_saldo(membro.id) + valor)
-    
+
     embed = discord.Embed(title="💸 Transferência Realizada", color=discord.Color.green())
     embed.add_field(name="De", value=ctx.author.mention, inline=True)
     embed.add_field(name="Para", value=membro.mention, inline=True)
     embed.add_field(name="Valor", value=f"{valor:,} moedas", inline=True)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1111,19 +1173,19 @@ async def investir(ctx, valor: int):
     """Investe moedas com chance de lucro ou perda"""
     if valor <= 0:
         return await ctx.send("❌ Valor deve ser positivo!")
-    
+
     saldo_atual = get_saldo(ctx.author.id)
     if saldo_atual < valor:
         return await ctx.send(f"❌ Saldo insuficiente! Você tem {saldo_atual:,} moedas.")
-    
+
     # 60% chance de ganhar, 40% de perder
     sucesso = random.random() < 0.6
-    
+
     if sucesso:
         multiplicador = random.uniform(1.2, 2.0)  # 20% a 100% de lucro
         ganho = int(valor * multiplicador) - valor
         set_saldo(ctx.author.id, saldo_atual + ganho)
-        
+
         embed = discord.Embed(title="📈 Investimento Bem-sucedido!", color=discord.Color.green())
         embed.add_field(name="Investido", value=f"{valor:,} moedas", inline=True)
         embed.add_field(name="Lucro", value=f"{ganho:,} moedas", inline=True)
@@ -1131,12 +1193,12 @@ async def investir(ctx, valor: int):
     else:
         perda = random.randint(int(valor * 0.3), valor)  # Perde 30% a 100%
         set_saldo(ctx.author.id, saldo_atual - perda)
-        
+
         embed = discord.Embed(title="📉 Investimento Fracassou!", color=discord.Color.red())
         embed.add_field(name="Investido", value=f"{valor:,} moedas", inline=True)
         embed.add_field(name="Perda", value=f"{perda:,} moedas", inline=True)
         embed.add_field(name="Restou", value=f"{saldo_atual - perda:,} moedas", inline=True)
-    
+
     await ctx.send(embed=embed)
 
 # ================== COMANDOS DE LOJA E LOTERIA ==================
@@ -1145,12 +1207,12 @@ async def investir(ctx, valor: int):
 async def loja(ctx):
     """Mostra a loja atual"""
     loja_atual = lojas[loja_atual_index]
-    
+
     embed = discord.Embed(title=f"🛍️ {loja_atual['nome']}", color=discord.Color.blue())
-    
+
     for item, preco in loja_atual['itens'].items():
         embed.add_field(name=item, value=f"{preco:,} moedas", inline=True)
-    
+
     embed.set_footer(text="Use &comprar <item> para comprar um item!")
     await ctx.send(embed=embed)
 
@@ -1159,31 +1221,31 @@ async def loja(ctx):
 async def comprar(ctx, *, item_nome: str):
     """Compra um item da loja"""
     loja_atual = lojas[loja_atual_index]
-    
+
     # Procurar item (case insensitive)
     item_encontrado = None
     preco_item = 0
-    
+
     for item, preco in loja_atual['itens'].items():
         if item_nome.lower() in item.lower():
             item_encontrado = item
             preco_item = preco
             break
-    
+
     if not item_encontrado:
         return await ctx.send("❌ Item não encontrado na loja atual!")
-    
+
     saldo_atual = get_saldo(ctx.author.id)
     if saldo_atual < preco_item:
         return await ctx.send(f"❌ Saldo insuficiente! Você precisa de {preco_item:,} moedas.")
-    
+
     set_saldo(ctx.author.id, saldo_atual - preco_item)
-    
+
     embed = discord.Embed(title="✅ Compra Realizada!", color=discord.Color.green())
     embed.add_field(name="Item", value=item_encontrado, inline=True)
     embed.add_field(name="Preço", value=f"{preco_item:,} moedas", inline=True)
     embed.add_field(name="Saldo Restante", value=f"{saldo_atual - preco_item:,} moedas", inline=True)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1192,7 +1254,7 @@ async def comprar_loteria(ctx, *numeros):
     """Compra um bilhete da loteria (6 números de 1 a 60)"""
     if len(numeros) != 6:
         return await ctx.send("❌ Você deve escolher exatamente 6 números!")
-    
+
     try:
         nums = [int(n) for n in numeros]
         if any(n < 1 or n > 60 for n in nums):
@@ -1201,30 +1263,30 @@ async def comprar_loteria(ctx, *numeros):
             return await ctx.send("❌ Não pode repetir números!")
     except ValueError:
         return await ctx.send("❌ Use apenas números!")
-    
+
     preco_bilhete = 10000
     saldo_atual = get_saldo(ctx.author.id)
-    
+
     if saldo_atual < preco_bilhete:
         return await ctx.send(f"❌ Você precisa de {preco_bilhete:,} moedas para comprar um bilhete!")
-    
+
     set_saldo(ctx.author.id, saldo_atual - preco_bilhete)
-    
+
     # Adicionar ao acumulado
     loteria["acumulado"] += preco_bilhete
-    
+
     # Salvar números do jogador
     user_str = str(ctx.author.id)
     if user_str not in loteria["numeros"]:
         loteria["numeros"][user_str] = []
-    
+
     loteria["numeros"][user_str].append(sorted(nums))
     save_loteria(loteria)
-    
+
     embed = discord.Embed(title="🎫 Bilhete Comprado!", color=discord.Color.gold())
     embed.add_field(name="Seus números", value=f"{sorted(nums)}", inline=False)
     embed.add_field(name="Prêmio acumulado", value=f"{loteria['acumulado']:,} moedas", inline=True)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1235,12 +1297,12 @@ async def loteria_info(ctx):
     embed.add_field(name="💰 Prêmio Acumulado", value=f"{loteria['acumulado']:,} moedas", inline=False)
     embed.add_field(name="🎫 Preço do Bilhete", value="10.000 moedas", inline=True)
     embed.add_field(name="🎯 Como Jogar", value="Escolha 6 números de 1 a 60", inline=True)
-    
+
     user_str = str(ctx.author.id)
     if user_str in loteria["numeros"] and loteria["numeros"][user_str]:
         bilhetes = len(loteria["numeros"][user_str])
         embed.add_field(name="📋 Seus Bilhetes", value=f"{bilhetes} bilhete(s)", inline=True)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1249,10 +1311,10 @@ async def sortear_loteria(ctx):
     """Sorteia a loteria (apenas admins)"""
     if not loteria["numeros"]:
         return await ctx.send("❌ Nenhum bilhete foi comprado!")
-    
+
     # Sortear números vencedores
     numeros_sorteados = sorted(random.sample(range(1, 61), 6))
-    
+
     # Verificar vencedores
     vencedores = []
     for user_id, bilhetes in loteria["numeros"].items():
@@ -1260,24 +1322,24 @@ async def sortear_loteria(ctx):
             acertos = len(set(bilhete) & set(numeros_sorteados))
             if acertos >= 4:  # 4+ acertos ganham
                 vencedores.append((user_id, acertos))
-    
+
     embed = discord.Embed(title="🎰 Resultado da Loteria!", color=discord.Color.gold())
     embed.add_field(name="🎯 Números Sorteados", value=f"{numeros_sorteados}", inline=False)
-    
+
     if vencedores:
         # Dividir prêmio entre vencedores
         premio_individual = loteria["acumulado"] // len(vencedores)
-        
+
         vencedores_texto = []
         for user_id, acertos in vencedores:
             user = bot.get_user(int(user_id))
             nome = user.display_name if user else f"Usuário {user_id}"
             set_saldo(int(user_id), get_saldo(int(user_id)) + premio_individual)
             vencedores_texto.append(f"{nome} ({acertos} acertos)")
-        
+
         embed.add_field(name="🏆 Vencedores", value="\n".join(vencedores_texto), inline=False)
         embed.add_field(name="💰 Prêmio Individual", value=f"{premio_individual:,} moedas", inline=True)
-        
+
         # Salvar no histórico
         loteria["historico"].append({
             "data": datetime.now().isoformat(),
@@ -1285,13 +1347,13 @@ async def sortear_loteria(ctx):
             "vencedores": len(vencedores),
             "premio": loteria["acumulado"]
         })
-        
+
         # Resetar loteria
         loteria["acumulado"] = 0
         loteria["numeros"] = {}
     else:
         embed.add_field(name="😢 Nenhum Vencedor", value="Prêmio acumula para o próximo sorteio!", inline=False)
-    
+
     save_loteria(loteria)
     await ctx.send(embed=embed)
 
@@ -1301,12 +1363,12 @@ async def beijar(ctx, membro: discord.Member):
     """Beija outro usuário"""
     if membro == ctx.author:
         return await ctx.send("❌ Você não pode beijar a si mesmo!")
-    
+
     gifs = [
         "https://media.giphy.com/media/G3va31oEEnIkM/giphy.gif",
         "https://media.giphy.com/media/bm2O3nXTcKJeU/giphy.gif"
     ]
-    
+
     embed = discord.Embed(
         description=f"{ctx.author.mention} beijou {membro.mention} 💋", 
         color=discord.Color.pink()
@@ -1325,7 +1387,7 @@ async def elogiar(ctx, membro: discord.Member):
         "é super talentoso(a)!",
         "ilumina o ambiente por onde passa!"
     ]
-    
+
     embed = discord.Embed(
         description=f"{membro.mention} {random.choice(elogios)} ✨", 
         color=discord.Color.gold()
@@ -1340,7 +1402,7 @@ async def mimar(ctx, membro: discord.Member):
         "https://media.giphy.com/media/ZBQhoZC0nqknSviPqT/giphy.gif",
         "https://media.giphy.com/media/lrr9rHuoJOE0w/giphy.gif"
     ]
-    
+
     embed = discord.Embed(
         description=f"{ctx.author.mention} está mimando {membro.mention} 🥰", 
         color=discord.Color.purple()
@@ -1349,18 +1411,18 @@ async def mimar(ctx, membro: discord.Member):
     await ctx.send(embed=embed)
 
 @bot.command()
-async def dancar(ctx, membro: discord.Member = None):
+async def dancar(ctx, membro: Optional[discord.Member] = None):
     """Dança com outro usuário ou sozinho"""
     gifs = [
         "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif",
         "https://media.giphy.com/media/3o7abGQa0aRJUurpII/giphy.gif"
     ]
-    
+
     if membro:
         texto = f"{ctx.author.mention} está dançando com {membro.mention} 💃🕺"
     else:
         texto = f"{ctx.author.mention} está dançando sozinho(a)! 💃"
-    
+
     embed = discord.Embed(description=texto, color=discord.Color.orange())
     embed.set_image(url=random.choice(gifs))
     await ctx.send(embed=embed)
@@ -1372,44 +1434,44 @@ async def warn(ctx, membro: discord.Member, *, motivo: str = "Sem motivo especif
     """Aplica um warn a um usuário"""
     if membro.id == ctx.author.id:
         return await ctx.send("❌ Você não pode dar warn em si mesmo!")
-    
+
     if membro.bot:
         return await ctx.send("❌ Não é possível dar warn em bots!")
-    
+
     user_id_str = str(membro.id)
     if user_id_str not in warns_data:
         warns_data[user_id_str] = []
-    
+
     warn_info = {
         "moderador": str(ctx.author),
         "motivo": motivo,
         "data": datetime.now().isoformat()
     }
-    
+
     warns_data[user_id_str].append(warn_info)
     save_json(WARN_FILE, warns_data)
-    
+
     total_warns = len(warns_data[user_id_str])
-    
+
     embed = discord.Embed(title="⚠️ Warn Aplicado", color=discord.Color.orange())
     embed.add_field(name="Usuário", value=membro.mention, inline=True)
     embed.add_field(name="Moderador", value=ctx.author.mention, inline=True)
     embed.add_field(name="Total de Warns", value=total_warns, inline=True)
     embed.add_field(name="Motivo", value=motivo, inline=False)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
-async def warns(ctx, membro: discord.Member = None):
+async def warns(ctx, membro: Optional[discord.Member] = None):
     """Mostra os warns de um usuário"""
     target = membro or ctx.author
     user_warns = warns_data.get(str(target.id), [])
-    
+
     if not user_warns:
         return await ctx.send(f"✅ {target.display_name} não possui warns!")
-    
+
     embed = discord.Embed(title=f"⚠️ Warns de {target.display_name}", color=discord.Color.orange())
-    
+
     for i, warn in enumerate(user_warns[-5:], 1):  # Últimos 5 warns
         data = datetime.fromisoformat(warn["data"]).strftime("%d/%m/%Y")
         embed.add_field(
@@ -1417,7 +1479,7 @@ async def warns(ctx, membro: discord.Member = None):
             value=f"**Motivo:** {warn['motivo']}\n**Moderador:** {warn['moderador']}\n**Data:** {data}",
             inline=False
         )
-    
+
     embed.set_footer(text=f"Total: {len(user_warns)} warns")
     await ctx.send(embed=embed)
 
@@ -1427,27 +1489,27 @@ async def removewarn(ctx, membro: discord.Member, indice: int):
     """Remove um warn específico"""
     user_id_str = str(membro.id)
     user_warns = warns_data.get(user_id_str, [])
-    
+
     if not user_warns:
         return await ctx.send(f"❌ {membro.display_name} não possui warns!")
-    
+
     if indice < 1 or indice > len(user_warns):
         return await ctx.send(f"❌ Índice inválido! Use um número entre 1 e {len(user_warns)}")
-    
+
     warn_removido = user_warns.pop(indice - 1)
-    
+
     if not user_warns:
         warns_data.pop(user_id_str, None)
     else:
         warns_data[user_id_str] = user_warns
-    
+
     save_json(WARN_FILE, warns_data)
-    
+
     embed = discord.Embed(title="✅ Warn Removido", color=discord.Color.green())
     embed.add_field(name="Usuário", value=membro.mention, inline=True)
     embed.add_field(name="Warn Removido", value=warn_removido["motivo"], inline=True)
     embed.add_field(name="Warns Restantes", value=len(user_warns), inline=True)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1456,17 +1518,17 @@ async def clearwarns(ctx, membro: discord.Member):
     """Remove todos os warns de um usuário"""
     user_id_str = str(membro.id)
     warns_removidos = len(warns_data.get(user_id_str, []))
-    
+
     if warns_removidos == 0:
         return await ctx.send(f"❌ {membro.display_name} não possui warns!")
-    
+
     warns_data.pop(user_id_str, None)
     save_json(WARN_FILE, warns_data)
-    
+
     embed = discord.Embed(title="🧹 Warns Limpos", color=discord.Color.green())
     embed.add_field(name="Usuário", value=membro.mention, inline=True)
     embed.add_field(name="Warns Removidos", value=warns_removidos, inline=True)
-    
+
     await ctx.send(embed=embed)
 
 @bot.command()
@@ -1480,7 +1542,7 @@ async def blacklist_add(ctx, membro: discord.Member, *, motivo: str = "Sem motiv
         "data": datetime.now().isoformat()
     }
     save_json(BLACKLIST_FILE, blacklist)
-    
+
     await ctx.send(f"🚫 {membro.mention} foi adicionado à blacklist!")
 
 @bot.command()
@@ -1490,10 +1552,10 @@ async def blacklist_remove(ctx, membro: discord.Member):
     user_id_str = str(membro.id)
     if user_id_str not in blacklist:
         return await ctx.send(f"❌ {membro.display_name} não está na blacklist!")
-    
+
     blacklist.pop(user_id_str, None)
     save_json(BLACKLIST_FILE, blacklist)
-    
+
     await ctx.send(f"✅ {membro.mention} foi removido da blacklist!")
 
 @bot.command()
@@ -1501,20 +1563,20 @@ async def blacklist_list(ctx):
     """Lista usuários na blacklist"""
     if not blacklist:
         return await ctx.send("✅ Nenhum usuário na blacklist!")
-    
+
     embed = discord.Embed(title="🚫 Lista de Blacklist", color=discord.Color.red())
-    
+
     for user_id, info in list(blacklist.items())[:10]:  # Máximo 10
         user = bot.get_user(int(user_id))
         nome = user.display_name if user else f"Usuário {user_id}"
         data = datetime.fromisoformat(info["data"]).strftime("%d/%m/%Y")
-        
+
         embed.add_field(
             name=nome,
             value=f"**Motivo:** {info['motivo']}\n**Data:** {data}",
             inline=False
         )
-    
+
     await ctx.send(embed=embed)
 
 # ================== COMANDOS ADMIN (MANTIDOS) ==================
@@ -1525,5 +1587,5 @@ async def setsaldo(ctx, membro: discord.Member, valor: int):
     await ctx.send(f"💰 Saldo de {membro.mention} ajustado para {valor:,} moedas!")
 
 # ================== RUN BOT ==================
-TOKEN = "MTM5NTk2ODUwMzE1MTg1NzcxNA.GGluds.G0eTqVbTVAD9IJw1nDMGHhJlwy6w328LN9cG6s"
+TOKEN = ""
 bot.run(TOKEN)
